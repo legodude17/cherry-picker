@@ -1,11 +1,13 @@
 using Verse;
 using System.Collections.Generic;
 using System;
+using System.Collections;
 using System.Linq;
 using RimWorld;
 using HarmonyLib;
 using System.Reflection;
 using System.Reflection.Emit;
+using MonoMod.Utils;
 using static CherryPicker.ModSettings_CherryPicker;
 using static CherryPicker.DefUtility;
  
@@ -103,7 +105,10 @@ namespace CherryPicker
 					DefDatabase<RaidAgeRestrictionDef>.AllDefs,
 					DefDatabase<WeaponTraitDef>.AllDefs,
 					DefDatabase<RulePackDef>.AllDefs,
-					DefDatabase<DefList>.AllDefs
+					DefDatabase<DefList>.AllDefs,
+					GetDefFromMod(packageID: "oskarpotocki.vanillafactionsexpanded.core", assemblyName:"VFECore", nameSpace:"VFECore.Abilities", typeName:"AbilityDef")
+                       .Where(x => x.modContentPack.PackageId == "vanillaexpanded.vpsycastse"),
+                    GetDefFromMod(packageID: "vanillaexpanded.vpsycastse", assemblyName: "VanillaPsycastsExpanded", nameSpace: "VanillaPsycastsExpanded", typeName: "PsycasterPathDef")
 				}.SelectMany(x => x).Distinct().ToArray();
 
 				//Process lists
@@ -567,9 +572,8 @@ namespace CherryPicker
 						break;
 					}
 
-					case nameof(AbilityDef):
+					case nameof(AbilityDef) when def is AbilityDef abilityDef:
 					{
-						AbilityDef abilityDef = def as AbilityDef;
 						abilityDef.level = int.MaxValue; //Won't make it past the random select filters
 						DefDatabase<PreceptDef>.AllDefsListForReading.ForEach(x => x.grantedAbilities?.Remove(abilityDef));
 						DefDatabase<RoyalTitleDef>.AllDefsListForReading.ForEach(x => x.grantedAbilities?.Remove(abilityDef));
@@ -742,7 +746,90 @@ namespace CherryPicker
 						}
 						break;
 					}
+
+					// Mod: Vanilla Psycasts Expanded
+                    case "PsycasterPathDef":
+                    {
+                        if (typeCache.TryGetValue("PsycasterPathDef", out Type type))
+                        {
+                            GenGeneric.InvokeStaticMethodOnGenericType(typeof(DefDatabase<>), type, "Remove", def);
+
+							// The InspectTab instances may be created before we run, so make sure to remove it from that cache in the tab
+                            if (!typeCache.TryGetValue("ITab_Pawn_Psycasts", out var iTabType))
+                            {
+                                iTabType = AccessTools.TypeByName("VanillaPsycastsExpanded.UI.ITab_Pawn_Psycasts");
+								typeCache.Add("ITab_Pawn_Psycasts", iTabType);
+                            }
+                            if (InspectTabManager.sharedInstances.TryGetValue(iTabType, out var iTab))
+                            {
+                                object paths = AccessTools.Field(iTabType, "pathsByTab").GetValue(iTab);
+                                foreach (var list in (paths as IDictionary).Values)
+                                {
+                                    (list as IList).Remove(def);
+                                }
+                            }
+                        }
+
+                        break;
+                    }
 					
+					// Mod: Vanilla Psycasts Expanded
+                    case "AbilityDef" when def.modContentPack.PackageId == "vanillaexpanded.vpsycastse":
+                    {
+						// Need to remove psycasts from the Path's cache
+                        if (typeCache.TryGetValue("PsycasterPathDef", out Type type))
+                        {
+							Log.Message("Found type " + type);
+                            Def blank = (Def) AccessTools.Field(type, "Blank").GetValue(null);
+							Log.Message("Found Blank: " + blank);
+                            AccessTools.FieldRef<Def, Def[][]> psycasts = AccessTools.FieldRefAccess<Def, Def[][]>(AccessTools.Field(type, "abilityLevelsInOrder"));
+                            if (!typeCache.TryGetValue("AbilityExtension_Psycast", out var psycastExtension))
+                            {
+                                psycastExtension = AccessTools.TypeByName("VanillaPsycastsExpanded.AbilityExtension_Psycast");
+								typeCache.Add("AbilityExtension_Psycast", psycastExtension);
+                            }
+
+                            AccessTools.FieldRef<object, List<Def>> prereqsGetter = AccessTools.FieldRefAccess<List<Def>>(psycastExtension, "prerequisites");
+                            Func<object, object> extensionGetter = GenGeneric.MethodOnGenericType(typeof(Def), psycastExtension, "GetModExtension")
+                               .CreateDelegate<Func<object, object>>();
+                            foreach (var path in (IEnumerable<Def>)GenGeneric.InvokeStaticMethodOnGenericType(typeof(DefDatabase<>), type, "get_AllDefs"))
+                            {
+                                Def[][] psycastLevels = psycasts(path);
+                                Log.Message("Found path " + path + " with psycasts " + psycastLevels);
+                                for (int i = 0; i < psycastLevels.Length; i++)
+                                {
+                                    var psycastLevel = psycastLevels[i];
+                                    for (int j = 0; j < psycastLevel.Length; j++)
+                                    {
+                                        var psycast = psycastLevel[j];
+										Log.Message("Found psycast " + psycast + " to remove " + (psycast.defName == def.defName));
+                                        if (psycast.defName == def.defName)
+                                        {
+											// Replace the psycast with a blank as to not break the display
+											Log.Message("Replacing with blank");
+                                            psycastLevels[i][j] = blank;
+                                        } else
+                                        {
+                                            var prereqs = prereqsGetter(extensionGetter(psycast));
+											Log.Message("Found prereqs " + prereqs);
+                                            if (prereqs != null && prereqs.Contains(def))
+                                            {
+												Log.Message("Rewriting prereqs");
+												// Need to rewire any psycasts that depend on this to depend on the ones this depends on
+												prereqs.Remove(def);
+                                                prereqs.AddRange(prereqsGetter(extensionGetter(def)));
+                                                prereqsGetter(extensionGetter(psycast)) = prereqs;
+                                            }
+                                        }
+                                    }
+                                }
+								psycasts(path) = psycastLevels;
+                            }
+                        }
+
+                        break;
+                    }
+
 					default:
 					{
 						Log.Error("[Cherry Picker] " + (def?.defName ?? "<unknown>") + " is an unknown type.");
@@ -839,6 +926,30 @@ namespace CherryPicker
 						((ScenarioDef)def).scenario.showInUI = true;
 						break;
 					}
+
+                    // Mod: Vanilla Psycasts Expanded
+                    case "PsycasterPathDef":
+                    {
+                        if (typeCache.TryGetValue("PsycasterPathDef", out Type type))
+                        {
+                            AccessTools.Method(typeof(DefDatabase<>).MakeGenericType(type), "Add", new[] { type }).Invoke(null, new object[]{def});
+                            // Need to also add it back to the cache on the ITab
+                            if (!typeCache.TryGetValue("ITab_Pawn_Psycasts", out var iTabType))
+                            {
+                                iTabType = AccessTools.TypeByName("VanillaPsycastsExpanded.UI.ITab_Pawn_Psycasts");
+                                typeCache.Add("ITab_Pawn_Psycasts", iTabType);
+                            }
+							
+                            if (InspectTabManager.sharedInstances.TryGetValue(iTabType, out var iTab))
+                            {
+                                object paths = AccessTools.Field(iTabType, "pathsByTab").GetValue(iTab);
+                                string tab = (string)AccessTools.Field(type, "tab").GetValue(def);
+                                ((paths as IDictionary)[tab] as IList).Add(def);
+                            }
+                        }
+
+                        break;
+                    }
 
 					default:
 					{
@@ -967,8 +1078,30 @@ namespace CherryPicker
 					}
 				}
 			}
-			
-			//Process pawnkinds that reference this item
+
+            Func<Def, DefModExtension> extensionGetter = null;
+            AccessTools.FieldRef<DefModExtension, List<object>> getUnlockData = null;
+            AccessTools.FieldRef<object, Def> getPath = null;
+			// Quick check for if VPE is loaded
+            if (typeCache.ContainsKey("PsycasterPathDef"))
+            {
+                if (!typeCache.TryGetValue("PawnKindAbilityExtension_Psycasts", out var extensionType))
+                {
+                    extensionType = AccessTools.TypeByName("VanillaPsycastsExpanded.PawnKindAbilityExtension_Psycasts");
+                    typeCache.Add("PawnKindAbilityExtension_Psycasts", extensionType);
+                }
+
+                if (!typeCache.TryGetValue("PathUnlockData", out var pathUnlockDataType))
+                {
+                    extensionType = AccessTools.TypeByName("VanillaPsycastsExpanded.PathUnlockData");
+                    typeCache.Add("PathUnlockData", pathUnlockDataType);
+                }
+
+                extensionGetter = GenGeneric.MethodOnGenericType(typeof(Def), extensionType, "GetModExtension").CreateDelegate<Func<Def, DefModExtension>>();
+                getUnlockData = AccessTools.FieldRefAccess<List<object>>(extensionType, "unlockedPaths");
+                getPath = AccessTools.FieldRefAccess<Def>(pathUnlockDataType, "path");
+            }
+            //Process pawnkinds that reference this item
 			length = DefDatabase<PawnKindDef>.DefCount;
 			for (int i = 0; i < length; ++i)
 			{
@@ -983,6 +1116,20 @@ namespace CherryPicker
 					pawnKindDef.isGoodBreacher = false; //Special checks
 				}
 				if (processXenotypes) pawnKindDef.xenotypeSet?.xenotypeChances?.RemoveAll(x => processedDefs.Contains(x.xenotype));
+
+                if (extensionGetter != null && getUnlockData != null && getPath != null)
+                {
+                    if (extensionGetter(pawnKindDef) is { } extension)
+                    {
+                        if (getUnlockData(extension) is { } unlockData)
+                        {
+                            for (int j = unlockData.Count; j-- > 0;)
+                            {
+                                if (processedDefs.Contains(getPath(unlockData[i]))) { unlockData.RemoveAt(j); }
+                            }
+                        }
+                    }
+                }
 			}
 
 			//Processes biomes
